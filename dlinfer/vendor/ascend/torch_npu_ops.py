@@ -7,6 +7,24 @@ from dlinfer.vendor import vendor_ops_registry
 from dlinfer.utils.registry import register_ops
 from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple
 
+import json
+from dataclasses import dataclass, asdict
+torch.classes.load_library("/data2/weitao/atb_models/output/atb_speed/lib/libatb_speed_torch.so")
+
+def create_op(op_name: str, params: Optional[str] = None, out = False):
+    op = torch.classes.OperationTorch.OperationTorch(op_name)
+    if params is not None:
+        params = json.dumps(asdict(params))
+        op.set_param(params)
+    else:
+        params = json.dumps({})
+        op.set_param(params)
+    if out:
+        return op.execute_out_with_param
+    else:
+        return op.execute 
+    
+
 __all__ = [
     "add_rms_norm",
     "apply_rotary_pos_emb",
@@ -33,6 +51,11 @@ def add_rms_norm(
     return normed_hidden_states, added_hidden_states
 
 
+@dataclass
+class RotaryParams:
+    rotaryCoeff: int = 2
+
+
 @register_ops(vendor_ops_registry)
 def apply_rotary_pos_emb(
     query: Tensor,
@@ -48,7 +71,34 @@ def apply_rotary_pos_emb(
         sin = sin.unsqueeze(2)
     query = query.contiguous()
     key = key.contiguous()
-    return torch.ops.npu.npu_apply_rotary_pos_emb(query, key, cos, sin, "BSND")
+    torch.ops.npu.npu_apply_rotary_pos_emb(query, key, cos, sin, "BSND")
+    return query, key
+    # bsz, seq_len, num_q_heads, head_dim = query.shape
+    # _, _, num_kv_heads, _ = key.shape
+    # query = query.view(bsz * seq_len, num_q_heads * head_dim)
+    # key = key.view(bsz * seq_len, num_kv_heads * head_dim)
+    # cos = cos.view(bsz * seq_len, head_dim)
+    # sin = sin.view(bsz * seq_len, head_dim)
+    # seq_len = torch.tensor([seq_len], dtype=torch.int32).cuda()
+    # params = RotaryParams(rotaryCoeff = 2)
+    # execute = create_op("RopeOperation", params)
+    # ropeQ_atb, ropeK_atb = execute([query, key, cos, sin, seq_len])
+    # ropeQ_atb = ropeQ_atb.view(bsz, seq_len, num_q_heads, head_dim)
+    # ropeK_atb = ropeK_atb.view(bsz, seq_len, num_kv_heads, head_dim)
+    # return ropeQ_atb, ropeK_atb
+
+
+@dataclass 
+class PagedAttentionPrefillParams:
+    headNum: int
+    kvHeadNum: int
+    qkScale: float = 1.0
+    qScale: float = 1.0
+    calcType: int = 3
+    kernelType: int = 1
+    clampType: int = 0
+    isTriuMask: int = 1
+    maskType: int = 0
 
 
 @register_ops(vendor_ops_registry)
@@ -77,46 +127,34 @@ def prefill_attention(
     key = key.contiguous()
     value = value.contiguous()
 
-    if attn_mask:
-        batch = q_start_loc.shape[0]
-        scale_value = 1.0 / math.sqrt(query.shape[-1])
-        for i in range(batch):
-            start = q_start_loc[i]
-            end = start + seq_len_list[i]
-            single_seqlen = int(seq_len_list[i])
-            single_q = query[start:end].view(1, single_seqlen, -1)
-            single_k = key[start:end].reshape(1, single_seqlen, -1)
-            single_v = value[start:end].reshape(1, single_seqlen, -1)
-            single_o = attn_output[start:end].view(1, single_seqlen, -1)
-            actual_seq_lengths = seq_len_list[i : i + 1]
-            torch.ops.npu_ext.npu_prompt_flash_attention_out(
-                single_q,
-                single_k,
-                single_v,
-                single_o,
-                padding_mask=None,
-                atten_mask=attn_mask[i],
-                actual_seq_lengths=actual_seq_lengths,
-                num_heads=num_q_heads,
-                scale_value=scale_value,
-                pre_tokens=2147473647,
-                next_tokens=0,
-                input_layout="BSH",
-                num_key_value_heads=num_kv_heads,
-            )
+    if attn_mask is not None:
+        params = PagedAttentionPrefillParams(
+        headNum=num_q_heads,
+        kvHeadNum=num_kv_heads,
+        qkScale=1.0 / math.sqrt(query.shape[-1]),
+        qScale=1.0, 
+        calcType=3, #paged encode
+        kernelType=0, # 1为高精度，0为默认
+        isTriuMask=1, #triu mask
+        maskType=1, #norm mask
+)    
+        execute = create_op("SelfAttentionOperation", params, True)
+        query = query.view(-1, num_q_heads * query.shape[-1])
+        key = key.view(-1, num_kv_heads * key.shape[-1])
+        value = value.view(-1, num_kv_heads * value.shape[-1])
+        # mask要求f16/bf16, seq_len要求int32
+        execute([query, key, value, attn_mask[0].type(torch.float16), q_seq_len.type(torch.int32)],[attn_output], json.dumps({ "seqLen": seq_len_list,"hasMask": True,}))
     else:
-        # For now, the value of attn_mask is None only in vit
-        scale_value = 1.0 / math.sqrt(query.shape[-1] // num_q_heads)
-        attn_output[:] = torch.ops.npu.npu_prompt_flash_attention(
-            query,
-            key,
-            value,
-            actual_seq_lengths=seq_len_list,
-            num_heads=num_q_heads,
-            scale_value=scale_value,
-            input_layout="BSH",
-            num_key_value_heads=num_kv_heads,
-        )
+        params = PagedAttentionPrefillParams(
+        headNum=num_q_heads,
+        kvHeadNum=num_kv_heads,
+        qkScale=1.0 / math.sqrt(query.shape[-1]),
+        qScale=1.0, 
+        calcType=3, #paged encode
+        maskType=0, #norm mask
+        )    
+        execute = create_op("SelfAttentionOperation", params, True)
+        execute([query, key, value],[attn_output], json.dumps({ "seqLen": seq_len_list, "hasMask": False,}))
     return attn_output
 
 
@@ -142,6 +180,12 @@ def fill_kv_cache(
     torch.ops.npu.npu_scatter_nd_update_(value_cache_reshaped, kv_indices, value)
     return key_cache, value_cache
 
+def fill_kv_cache_atb(key, value, key_cache, value_cache, kv_indices):
+    kv_indices = kv_indices.flatten()
+    execute = create_op("ReshapeAndCacheOperation")
+    updated_k_cache, updated_v_cache = execute([key, value, key_cache, value_cache, kv_indices])
+    return updated_k_cache, updated_v_cache
+
 
 @register_ops(vendor_ops_registry)
 def fill_contiguous_kvcache(
@@ -156,6 +200,12 @@ def fill_contiguous_kvcache(
 def get_cache_len(cache: Tensor):
     return cache.shape[1]
 
+@dataclass
+class PagedAttentionParams:
+    headNum: int
+    qkScale: float
+    kvHeadNum: int
+    maskType: int = 0
 
 @register_ops(vendor_ops_registry)
 def paged_decode_attention(
@@ -179,37 +229,14 @@ def paged_decode_attention(
     if isinstance(block_table, torch.Tensor) and block_table.dtype != torch.int32:
         block_table = block_table.to(torch.int32)
 
-    bs, _, dim = query.shape
-    query = query.contiguous()
-    query = query.view(bs, 1, num_q_heads * dim)
-    kv_cache_len = key_cache.shape[0]
-    key_cache = key_cache.view(1, kv_cache_len, -1)
-    value_cache = value_cache.view(1, kv_cache_len, -1)
-    scale_value = 1.0 / math.sqrt(dim)
-
-    torch.ops.npu_ext.npu_incre_flash_attention_v4_out(
-        query,
-        key_cache,
-        value_cache,
-        attn_output.view_as(query),
-        padding_mask=None,
-        atten_mask=None,
-        actual_seq_lengths=kv_seq_len.tolist(),
-        antiquant_scale=None,
-        antiquant_offset=None,
-        block_table=block_table,
-        dequant_scale1=None,
-        quant_scale1=None,
-        dequant_scale2=None,
-        quant_scale2=None,
-        quant_offset2=None,
-        num_heads=num_q_heads,
-        scale_value=scale_value,
-        input_layout="BSH",
-        num_key_value_heads=num_kv_heads,
-        block_size=block_size,
-        inner_precise=1,
-    )
+    ntokens, _, head_size = query.shape
+    total_block, _, _ = key_cache.shape
+    key_cache = key_cache.view(total_block//block_size, block_size, num_kv_heads, head_size)
+    value_cache = value_cache.view(total_block//block_size, block_size, num_kv_heads, head_size)
+    contextLens = kv_seq_len.tolist()
+    params = PagedAttentionParams(headNum=num_q_heads, qkScale=1.0 / math.sqrt(head_size), kvHeadNum=num_kv_heads)
+    execute = create_op("PagedAttentionOperation", params, True)
+    execute([query, key_cache, value_cache, block_table.type(torch.int32), kv_seq_len.to(torch.int32)], [attn_output], json.dumps({"contextLen":contextLens}))
     return attn_output
 
 
@@ -279,10 +306,16 @@ def paged_prefill_attention(
     return attn_output
 
 
+@dataclass
+class RmsNormParams:
+    epsilon: float
+
+
 @register_ops(vendor_ops_registry)
 def rms_norm(hidden_states: Tensor, weight: Tensor, epsilon: float) -> Tensor:
-    hidden_states = hidden_states.contiguous()
-    return torch.ops.npu.npu_rms_norm(hidden_states, weight, epsilon)[0]
+    params = RmsNormParams(epsilon=epsilon)
+    execute = create_op("RmsNormOperation", params)
+    return execute([hidden_states, weight])[0]
 
 
 @register_ops(vendor_ops_registry)
