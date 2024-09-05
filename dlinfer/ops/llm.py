@@ -1,6 +1,6 @@
 # Copyright (c) 2024, DeepLink. All rights reserved.
 from dlinfer.vendor import vendor_ops_registry
-from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple
+from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple, List
 from dlinfer.utils.graph.custom_op import (
     register_custom_op,
     register_custom_op_default_value,
@@ -19,8 +19,36 @@ __all__ = [
     "fused_attention",
     "fill_contiguous_kvcache",
     "get_cache_len",
+    "split",
+    "concat",
+    "linear",
 ]
 
+@register_custom_op("dlinfer::split", ["x"])
+def split(
+    x: Tensor,
+    split_dim: int,
+    split_num: int,
+) -> Tuple[Tensor, ...]:
+    return vendor_ops_registry["split"](x, split_dim, split_num)
+
+@register_custom_op("dlinfer::concat", ["x", "y"])
+def concat(
+    x: Tensor,
+    y: Tensor,
+    concat_dim: int,
+) -> Tensor:
+    return vendor_ops_registry["concat"](x, y, concat_dim)
+
+@register_custom_op("dlinfer::Linear", ["x", "weight", "bias"])
+def linear(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    transpose_a: bool = False,
+    transpose_b: bool = False,
+) -> Tensor:
+    return vendor_ops_registry["linear"](x, weight, bias, None, transpose_a, transpose_b)
 
 @register_custom_op("dlinfer::add_rms_norm", ["hidden_states", "residual"])
 def add_rms_norm(
