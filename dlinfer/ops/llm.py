@@ -46,7 +46,7 @@ def linear(
     weight: Tensor,
     bias: Optional[Tensor],
     transpose_a: bool = False,
-    transpose_b: bool = False,
+    transpose_b: bool = True,
 ) -> Tensor:
     return vendor_ops_registry["linear"](x, weight, bias, None, transpose_a, transpose_b)
 

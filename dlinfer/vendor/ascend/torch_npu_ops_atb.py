@@ -3,19 +3,32 @@ import math
 import torch
 import torch_npu
 
-from typing import List, Dict
+from typing import List
 from dlinfer.vendor import vendor_ops_registry
 from dlinfer.utils.registry import register_ops
 from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple
 
-# from torch.profiler import record_function
 import json
 from dataclasses import dataclass, asdict
 torch.classes.load_library("/data2/weitao/atb_models/output/atb_speed/lib/libatb_speed_torch.so")
 
-atb_op_manager = {}
-
 atb_op = torch.classes.OperationTorch.OperationTorch("ATB")
+
+def create_op(op_name: str, params: Optional[str] = None, out = False, nb = False):
+    op = torch.classes.OperationTorch.OperationTorch(op_name)
+    if params is not None:
+        params = json.dumps(asdict(params))
+        op.set_param(params)
+    else:
+        params = json.dumps({})
+        op.set_param(params)
+    if not nb:
+        if out:
+            return op.execute_out_with_param
+        else:
+            return op.execute 
+    else:
+        return op.execute_out
 
 __all__ = [
     "add_rms_norm",
@@ -27,8 +40,40 @@ __all__ = [
     "rms_norm",
     "moe_gating_topk_softmax",
     "get_cache_len",
-    "linear",
 ]
+
+@dataclass
+class SplitParams:
+    splitDim: int = 0
+    splitNum: int = 2
+    name: str = "Split"
+
+@register_ops(vendor_ops_registry)
+def split(
+    x: Tensor,
+    split_dim: int = 0,
+    split_num: int = 2,
+) -> List[Tensor]:
+    params = SplitParams(splitDim=split_dim, splitNum=split_num)
+    atb_op.set_op_name("SplitOperation")
+    atb_op.set_param(json.dumps(params.__dict__))
+    return atb_op.execute([x])
+
+@dataclass
+class ConcatParams:
+    concatDim: int = 0
+    name: str = "Concat"
+
+@register_ops(vendor_ops_registry)
+def concat(
+    x: Tensor,
+    y:Tensor,
+    concat_dim: int = 0,
+) -> Tensor:
+    import pdb; pdb.set_trace()
+    params = ConcatParams(concatDim=concat_dim)
+    execute = create_op("ConcatOperation", params)
+    return execute([x, y])
 
 @dataclass
 class LinearParams:
@@ -51,16 +96,15 @@ def linear(
     if deqscale is not None:
         raise RuntimeError("linear does not support deqscale yet")
     has_bais = bias is not None
-    if "LineraOperation" not in atb_op_manager:
-        params = LinearParams(transposeA=transpose_a, transposeB=transpose_b, hasBias=has_bais)
-        atb_op = torch.classes.OperationTorch.OperationTorch("LinearOperation")
-        atb_op.set_param(json.dumps(params.__dict__))
-        atb_op_manager["LinearOperation"] = atb_op
+    params = LinearParams(transposeA=transpose_a, transposeB=transpose_b, hasBias=has_bais)
+    atb_op.set_op_name("LinearOperation")
+    atb_op.set_param(json.dumps(params.__dict__))
     if has_bais:
         import pdb; pdb.set_trace()
-        return atb_op_manager["LinearOperation"].execute([x, weight, bias])[0]
+        return atb_op.execute([x, weight, bias])[0]
     else:
-        return atb_op_manager["LinearOperation"].execute([x, weight])[0]
+        return atb_op.execute([x, weight])[0]
+
 
 @register_ops(vendor_ops_registry)
 def add_rms_norm(
@@ -94,14 +138,11 @@ def apply_rotary_pos_emb(
         cos = cos.unsqueeze(2)
     if len(sin.shape) < 4:
         sin = sin.unsqueeze(2)
-            
-    if "RopeOperation" not in atb_op_manager:
-        params = RotaryParams(rotaryCoeff = 2)
-        atb_op = torch.classes.OperationTorch.OperationTorch("RopeOperation")
-        # with torch.profiler.record_function("set_param"):
-        atb_op.set_param(json.dumps(params.__dict__))
-        atb_op_manager["RopeOperation"] = atb_op
-        
+    query = query.contiguous()
+    key = key.contiguous()
+    # torch.ops.npu.npu_apply_rotary_pos_emb(query, key, cos, sin, "BSND")
+    # return query, key
+    torch.cuda.synchronize()
     bsz, seq_len, num_q_heads, head_dim = query.shape
     _, _, num_kv_heads, _ = key.shape
     query = query.view(bsz * seq_len, num_q_heads * head_dim)
@@ -109,16 +150,15 @@ def apply_rotary_pos_emb(
     cos = cos.view(bsz * seq_len, head_dim)
     sin = sin.view(bsz * seq_len, head_dim)
     seq_len = torch.tensor([seq_len], dtype=torch.int32).cuda()
-
-    # with torch.profiler.record_function("set_op_name"):
-    #     atb_op.set_op_name("RopeOperation")
-    # with torch.profiler.record_function("set_param"):
-    #     atb_op.set_param(json.dumps(params.__dict__))
-    # with torch.profiler.record_function("execute_out"):
-    atb_op_manager["RopeOperation"].execute_out([query, key, cos, sin, seq_len], [query, key])
+    params = RotaryParams(rotaryCoeff = 2)
+    atb_op.set_op_name("RopeOperation")
+    atb_op.set_param(json.dumps(params.__dict__))
+    atb_op.execute_out([query, key, cos, sin, seq_len], [query, key])
     ropeQ_atb = query.view(bsz, seq_len, num_q_heads, head_dim)
     ropeK_atb = key.view(bsz, seq_len, num_kv_heads, head_dim)
+    torch.cuda.synchronize()
     return ropeQ_atb, ropeK_atb
+
 
 @dataclass 
 class PagedAttentionPrefillParams:
@@ -155,16 +195,62 @@ def prefill_attention(
     # cann prompt_fa don't support batch query with different seq_len
     seq_len_list = None if q_seq_len is None else q_seq_len.tolist()
     if attn_output is None:
-        attn_output = torch.empty_like(query).cuda()
         import pdb; pdb.set_trace()
 
+    # attn_output_atb = torch.empty_like(query).cuda()
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
     attn_output = prefill_attention_atb(query, key, value, q_seq_len, num_q_heads, num_kv_heads, attn_mask, attn_output)
+    # torch.cuda.synchronize()
+    # if attn_mask:
+    #     batch = q_start_loc.shape[0]
+    #     scale_value = 1.0 / math.sqrt(query.shape[-1])
+    #     for i in range(batch):
+    #         start = q_start_loc[i]
+    #         end = start + seq_len_list[i]
+    #         single_seqlen = int(seq_len_list[i])
+    #         single_q = query[start:end].view(1, single_seqlen, -1)
+    #         single_k = key[start:end].reshape(1, single_seqlen, -1)
+    #         single_v = value[start:end].reshape(1, single_seqlen, -1)
+    #         single_o = attn_output[start:end].view(1, single_seqlen, -1)
+    #         actual_seq_lengths = seq_len_list[i : i + 1]
+    #         torch.ops.npu_ext.npu_prompt_flash_attention_out(
+    #             single_q,
+    #             single_k,
+    #             single_v,
+    #             single_o,
+    #             padding_mask=None,
+    #             atten_mask=attn_mask[i],
+    #             actual_seq_lengths=actual_seq_lengths,
+    #             num_heads=num_q_heads,
+    #             scale_value=scale_value,
+    #             pre_tokens=2147473647,
+    #             next_tokens=0,
+    #             input_layout="BSH",
+    #             num_key_value_heads=num_kv_heads,
+    #         )
+    # # print(torch.allclose(attn_output_atb, attn_output))
+    # # import pdb; pdb.set_trace()
+    # else:
+    #     # For now, the value of attn_mask is None only in vit
+    #     scale_value = 1.0 / math.sqrt(query.shape[-1] // num_q_heads)
+    #     attn_output[:] = torch.ops.npu.npu_prompt_flash_attention(
+    #         query,
+    #         key,
+    #         value,
+    #         actual_seq_lengths=seq_len_list,
+    #         num_heads=num_q_heads,
+    #         scale_value=scale_value,
+    #         input_layout="BSH",
+    #         num_key_value_heads=num_kv_heads,
+    #     )
     return attn_output
 
 def prefill_attention_atb(query, key, value, q_seq_len,  num_q_heads, num_kv_heads, attn_mask, attn_output):
     seq_len_list = [] if q_seq_len is None else q_seq_len.tolist()
-    if "SelfAttentionOperation" not in atb_op_manager:
-        atb_op = torch.classes.OperationTorch.OperationTorch("SelfAttentionOperation")
+    atb_op.set_op_name("SelfAttentionOperation")
+    if attn_mask is not None:
         params = PagedAttentionPrefillParams(
         headNum=num_q_heads,
         kvHeadNum=num_kv_heads,
@@ -174,28 +260,19 @@ def prefill_attention_atb(query, key, value, q_seq_len,  num_q_heads, num_kv_hea
         kernelType=1, # 1为高精度，0为默认
         isTriuMask=1, #triu mask
         maskType=1, #norm mask
-)        
-        # with torch.profiler.record_function("set_param"):
-        atb_op.set_param(json.dumps(params.__dict__))
-        atb_op_manager["SelfAttentionOperation"] = atb_op
-        
-    # with torch.profiler.record_function("set_op_name"):
-    #     atb_op.set_op_name("SelfAttentionOperation")
-    if attn_mask is not None:
-        # import pdb; pdb.set_trace()
+)       
         if attn_mask.dtype != query.dtype:
             attn_mask = attn_mask.to(query.dtype)
         if q_seq_len.dtype != torch.int32:
             q_seq_len = q_seq_len.to(torch.int32)
+        atb_op.set_param(json.dumps(params.__dict__))
         query = query.view(-1, num_q_heads * query.shape[-1])
         key = key.view(-1, num_kv_heads * key.shape[-1])
         value = value.view(-1, num_kv_heads * value.shape[-1])
         # mask要求f16/bf16, seq_len要求int32
-        # with torch.profiler.record_function("execute_out_with_param"):
-        # import pdb; pdb.set_trace()
-        atb_op_manager["SelfAttentionOperation"].execute_out_with_param([query, key, value, attn_mask, q_seq_len.to(query.device)],[attn_output], json.dumps({"seqLen": seq_len_list, "hasMask": True,}))
+        atb_op.execute_out_with_param([query, key, value, attn_mask, q_seq_len],[attn_output], json.dumps({"seqLen": seq_len_list, "hasMask": True,}))
+        torch.cuda.synchronize()
     else:
-        import pdb; pdb.set_trace()
         params = PagedAttentionPrefillParams(
         headNum=num_q_heads,
         kvHeadNum=num_kv_heads,
@@ -208,8 +285,6 @@ def prefill_attention_atb(query, key, value, q_seq_len,  num_q_heads, num_kv_hea
         atb_op.execute_out_with_param([query, key, value],[attn_output], json.dumps({ "seqLen": seq_len_list, "hasMask": False,}))
     return attn_output
 
-
-
 @register_ops(vendor_ops_registry)
 def fill_kv_cache(
     key: Tensor,
@@ -218,32 +293,33 @@ def fill_kv_cache(
     value_cache: Tensor,
     kv_indices: Tensor,
 ) -> Tuple[Tensor, Tensor]:
-    # import pdb; pdb.set_trace()
-    if kv_indices.dtype != torch.int32:
-        kv_indices = kv_indices.to(torch.int32)
-    _, num_heads, head_dim = key.shape
-    num_blocks, block_size, hidden_size = key_cache.shape
-    key_cache_reshaped = key_cache.view(num_blocks, block_size, num_heads, head_dim)
-    value_cache_reshaped = value_cache.view(num_blocks, block_size, num_heads, head_dim)
-    fill_kv_cache_atb(key, value, key_cache_reshaped, value_cache_reshaped, kv_indices)
-    # key_cache = key_cache.view(num_blocks, block_size, hidden_size)
-    # value_cache = value_cache.view(num_blocks, block_size, hidden_size)
+    head, dim = key.shape[1:]
+    block_num, block_size = key_cache.shape[:2]
+    block_total = block_num * block_size
+
+    # only support contiguous k,v
+    key = key.contiguous()
+    value = value.contiguous()
+    # not emplace会开辟新空间
+    # key_cache_atb, value_cache_atb = fill_kv_cache_atb(key, value, key_cache, value_cache, kv_indices)
+    # return key_cache_atb, value_cache_atb
+    torch.cuda.synchronize()
+    fill_kv_cache_atb(key, value, key_cache, value_cache, kv_indices)
+    torch.cuda.synchronize()
     return key_cache, value_cache
+    # import pdb; pdb.set_trace()
+    # key_cache_reshaped = key_cache.view(block_total, head, dim)
+    # value_cache_reshaped = value_cache.view(block_total, head, dim)
+    # torch.ops.npu.npu_scatter_nd_update_(key_cache_reshaped, kv_indices, key)
+    # torch.ops.npu.npu_scatter_nd_update_(value_cache_reshaped, kv_indices, value)
+    # return key_cache, value_cache
 
 def fill_kv_cache_atb(key, value, key_cache, value_cache, kv_indices):
     kv_indices = kv_indices.flatten()
-    if "ReshapeAndCacheOperation" not in atb_op_manager:
-        atb_op = torch.classes.OperationTorch.OperationTorch("ReshapeAndCacheOperation")
-        # with record_function("set_param"):
-        atb_op.set_param(json.dumps({}))
-        atb_op_manager["ReshapeAndCacheOperation"] = atb_op
-    # with record_function("set_op_name"):
-    #     atb_op.set_op_name("ReshapeAndCacheOperation")
-
-    # with record_function("execute_out"):
-    atb_op_manager["ReshapeAndCacheOperation"].execute_out([key, value, key_cache, value_cache, kv_indices], [key_cache, value_cache])
-    # import pdb; pdb.set_trace()
-
+    atb_op.set_op_name("ReshapeAndCacheOperation")
+    atb_op.set_param(json.dumps({}))
+    atb_op.execute_out([key, value, key_cache, value_cache, kv_indices], [key_cache, value_cache])
+    torch.cuda.synchronize()
 
 @register_ops(vendor_ops_registry)
 def fill_contiguous_kvcache(
@@ -257,7 +333,6 @@ def fill_contiguous_kvcache(
 @register_ops(vendor_ops_registry)
 def get_cache_len(cache: Tensor):
     return cache.shape[1]
-
 
 @dataclass
 class PagedAttentionParams:
@@ -288,30 +363,53 @@ def paged_decode_attention(
     if isinstance(block_table, torch.Tensor) and block_table.dtype != torch.int32:
         block_table = block_table.to(torch.int32)
     paged_decode_attentio_atb(query, key_cache, value_cache, block_table, block_size, kv_seq_len, num_q_heads, num_kv_heads, attn_output)
+    # bs, _, dim = query.shape
+    # query = query.contiguous()
+    # query = query.view(bs, 1, num_q_heads * dim)
+    # kv_cache_len = key_cache.shape[0]
+    # key_cache = key_cache.view(1, kv_cache_len, -1)
+    # value_cache = value_cache.view(1, kv_cache_len, -1)
+    # scale_value = 1.0 / math.sqrt(dim)
+
+    # torch.ops.npu_ext.npu_incre_flash_attention_v4_out(
+    #     query,
+    #     key_cache,
+    #     value_cache,
+    #     attn_output.view_as(query),
+    #     padding_mask=None,
+    #     atten_mask=None,
+    #     actual_seq_lengths=kv_seq_len.tolist(),
+    #     antiquant_scale=None,
+    #     antiquant_offset=None,
+    #     block_table=block_table,
+    #     dequant_scale1=None,
+    #     quant_scale1=None,
+    #     dequant_scale2=None,
+    #     quant_scale2=None,
+    #     quant_offset2=None,
+    #     num_heads=num_q_heads,
+    #     scale_value=scale_value,
+    #     input_layout="BSH",
+    #     num_key_value_heads=num_kv_heads,
+    #     block_size=block_size,
+    #     inner_precise=1,
+    # )
     return attn_output
 
 def paged_decode_attentio_atb(query, key_cache, value_cache, block_table, block_size, kv_seq_len, num_q_heads, num_kv_heads, attn_output):
-    # import pdb; pdb.set_trace()
     _, _, head_dim = query.shape
-    num_blocks, _, hidden_size = key_cache.shape
-    # import pdb; pdb.set_trace()
-    key_cache_reshaped = key_cache.view(num_blocks, block_size, num_kv_heads, head_dim)
-    value_cache_reshaped = value_cache.view(num_blocks, block_size, num_kv_heads, head_dim)
+    total_block, _, _ = key_cache.shape
+    key_cache = key_cache.view(total_block//block_size, block_size, num_kv_heads, head_dim)
+    value_cache = value_cache.view(total_block//block_size, block_size, num_kv_heads, head_dim)
     contextLens = kv_seq_len.tolist()
-    if "PagedAttentionOperation" not in atb_op_manager:
-        atb_op = torch.classes.OperationTorch.OperationTorch("PagedAttentionOperation")
-        params = PagedAttentionParams(headNum=num_q_heads, qkScale=1.0 / math.sqrt(head_dim), kvHeadNum=num_kv_heads)
-        # with torch.profiler.record_function("set_param"):
-        atb_op.set_param(json.dumps(params.__dict__))
-        atb_op_manager["PagedAttentionOperation"] = atb_op
-    # with torch.profiler.record_function("set_op_name"):
-    #     atb_op.set_op_name("PagedAttentionOperation")
-
-    # with torch.profiler.record_function("execute_out_with_param"):
-    atb_op_manager["PagedAttentionOperation"].execute_out_with_param([query, key_cache_reshaped, value_cache_reshaped, block_table, kv_seq_len.to(torch.int32).to(query.device)], [attn_output], json.dumps({"contextLen":contextLens}))
+    params = PagedAttentionParams(headNum=num_q_heads, qkScale=1.0 / math.sqrt(head_dim), kvHeadNum=num_kv_heads)
+    atb_op.set_op_name("PagedAttentionOperation")
+    atb_op.set_param(json.dumps(params.__dict__))
     # import pdb; pdb.set_trace()
+    atb_op.execute_out_with_param([query, key_cache, value_cache, block_table, kv_seq_len.to(torch.int32)], [attn_output], json.dumps({"contextLen":contextLens}))
+    torch.cuda.synchronize() # 不需要同步
     return attn_output
-
+    
 
 @register_ops(vendor_ops_registry)
 def paged_prefill_attention(
@@ -330,7 +428,7 @@ def paged_prefill_attention(
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
 ) -> Tensor:
-    # import pdb; pdb.set_trace()
+    import pdb; pdb.set_trace()
     if alibi_slopes is not None:
         raise RuntimeError(
             "paged_decode_attention does not " "support alibi_slopes yet"
@@ -341,103 +439,58 @@ def paged_prefill_attention(
         )
     if block_table.dtype != torch.int32:
         block_table = block_table.to(torch.int32)
-    if "PagedPrefillAttentionOperation" not in atb_op_manager:
-        atb_op = torch.classes.OperationTorch.OperationTorch("PagedAttentionOperation")
-        params = PagedAttentionParams(headNum=num_q_heads, qkScale=1.0 / math.sqrt(query.shape[-1]), kvHeadNum=num_kv_heads, maskType=1)
-        # with torch.profiler.record_function("set_param"):
-        atb_op.set_param(json.dumps(params.__dict__))
-        atb_op_manager["PagedPrefillAttentionOperation"] = atb_op
-    
-    if attn_output is None:
-        attn_output = torch.empty_like(query).cuda()
-    
-    if attn_mask.dtype != query.dtype:
-        attn_mask = attn_mask.to(query.dtype)
-    atb_out_origin = torch.empty_like(query).cuda()
-    block_table_atb = torch.cat([block_table] * q_seq_len, dim = 0).cuda()
-    kv_seq_len_atb = torch.cat([kv_seq_len] * q_seq_len, dim = 0).cuda()
-    import pdb; pdb.set_trace()
-    atb_out = paged_prefill_attention_atb(query, key_cache, value_cache, block_table_atb, block_size, q_start_loc, q_seq_len, kv_seq_len_atb, num_q_heads, num_kv_heads, attn_mask[0], None, None, atb_out_origin)
-    # # cann incre_fa don't support paged_attn when q_seq_len > 1
-    # batch = q_start_loc.shape[0]
-    # q_seq_len_list = q_seq_len.tolist()
-    # kv_seq_len_list = kv_seq_len.tolist()
-    # scale_value = 1.0 / math.sqrt(query.shape[-1])
-    # query = query.contiguous()
-    # for i in range(batch):
-    #     start = q_start_loc[i]
-    #     mask = attn_mask[i]
-    #     for j in range(q_seq_len_list[i]):
-    #         single_q = query[start + j : start + j + 1].view(1, 1, -1)
-    #         single_o = attn_output[start + j : start + j + 1].view(1, 1, -1)
-    #         torch.ops.npu_ext.npu_incre_flash_attention_v4_out(
-    #             single_q,
-    #             key_cache,
-    #             value_cache,
-    #             single_o,
-    #             padding_mask=None,
-    #             atten_mask=mask[j : j + 1],
-    #             actual_seq_lengths=kv_seq_len_list[i : i + 1],
-    #             antiquant_scale=None,
-    #             antiquant_offset=None,
-    #             block_table=block_table,
-    #             dequant_scale1=None,
-    #             quant_scale1=None,
-    #             dequant_scale2=None,
-    #             quant_scale2=None,
-    #             quant_offset2=None,
-    #             num_heads=num_q_heads,
-    #             scale_value=scale_value,
-    #             input_layout="BSH",
-    #             num_key_value_heads=num_kv_heads,
-    #             block_size=block_size,
-    #             inner_precise=1,
-    #         )
-    # import pdb; pdb.set_trace()
-    return atb_out
 
-
-def paged_prefill_attention_atb(    
-    query: Tensor,
-    key_cache: Tensor,
-    value_cache: Tensor,
-    block_table: Tensor,
-    block_size: int,
-    q_start_loc: Tensor,
-    q_seq_len: Tensor,
-    kv_seq_len: Tensor,
-    num_q_heads: int,
-    num_kv_heads: int,
-    attn_mask: Sequence[Optional[Tensor]],
-    softmax_scale: Optional[float],
-    alibi_slopes: Optional[Sequence[float]],
-    attn_output: Optional[Tensor],):
-    # import pdb; pdb.set_trace()
-    _, _, head_dim = query.shape
-    num_blocks, _, hidden_size = key_cache.shape
-    key_cache_reshaped = key_cache.view(num_blocks, block_size, num_kv_heads, head_dim)
-    value_cache_reshaped = value_cache.view(num_blocks, block_size, num_kv_heads, head_dim)
-    contextLens = kv_seq_len.tolist()
-    # import pdb; pdb.set_trace()
-    atb_op_manager["PagedPrefillAttentionOperation"].execute_out_with_param([query, key_cache_reshaped, value_cache_reshaped, block_table, kv_seq_len.to(torch.int32).to(query.device), attn_mask], [attn_output], json.dumps({"contextLen":contextLens}))
+    # cann incre_fa don't support paged_attn when q_seq_len > 1
+    batch = q_start_loc.shape[0]
+    q_seq_len_list = q_seq_len.tolist()
+    kv_seq_len_list = kv_seq_len.tolist()
+    scale_value = 1.0 / math.sqrt(query.shape[-1])
+    query = query.contiguous()
+    for i in range(batch):
+        start = q_start_loc[i]
+        mask = attn_mask[i]
+        for j in range(q_seq_len_list[i]):
+            single_q = query[start + j : start + j + 1].view(1, 1, -1)
+            single_o = attn_output[start + j : start + j + 1].view(1, 1, -1)
+            torch.ops.npu_ext.npu_incre_flash_attention_v4_out(
+                single_q,
+                key_cache,
+                value_cache,
+                single_o,
+                padding_mask=None,
+                atten_mask=mask[j : j + 1],
+                actual_seq_lengths=kv_seq_len_list[i : i + 1],
+                antiquant_scale=None,
+                antiquant_offset=None,
+                block_table=block_table,
+                dequant_scale1=None,
+                quant_scale1=None,
+                dequant_scale2=None,
+                quant_scale2=None,
+                quant_offset2=None,
+                num_heads=num_q_heads,
+                scale_value=scale_value,
+                input_layout="BSH",
+                num_key_value_heads=num_kv_heads,
+                block_size=block_size,
+                inner_precise=1,
+            )
     return attn_output
+
 
 @dataclass
 class RmsNormParams:
     epsilon: float
 
+
 @register_ops(vendor_ops_registry)
 def rms_norm(hidden_states: Tensor, weight: Tensor, epsilon: float) -> Tensor:
-    if "RmsNormOperation" not in atb_op_manager:
-        atb_op = torch.classes.OperationTorch.OperationTorch("RmsNormOperation")
-        params = RmsNormParams(epsilon=epsilon)
-        # with torch.profiler.record_function("set_param"):
-        atb_op.set_param(json.dumps(params.__dict__))
-        atb_op_manager["RmsNormOperation"] = atb_op
-
+    params = RmsNormParams(epsilon=epsilon)
+    atb_op.set_op_name("RmsNormOperation")
+    atb_op.set_param(json.dumps(params.__dict__))
     # import pdb; pdb.set_trace()
-    # with torch.profiler.record_function("execute"):
-    out = atb_op_manager["RmsNormOperation"].execute([hidden_states, weight])[0]
+    out = atb_op.execute([hidden_states, weight])[0]
+    torch.cuda.synchronize() # 必须得要同步
     return out
 
 
