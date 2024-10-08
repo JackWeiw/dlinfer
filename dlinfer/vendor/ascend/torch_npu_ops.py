@@ -11,13 +11,11 @@ from dlinfer.utils.type_annotation import Tensor, Optional, Sequence, Tuple
 # from torch.profiler import record_function
 import json
 from dataclasses import dataclass, asdict
-torch.classes.load_library("/data2/weitao/atb_models/output/atb_speed/lib/libatb_speed_torch.so")
+torch.classes.load_library("/data2/weitao/ci/dev/AscendATB/output/atb_speed/lib/libatb_speed_torch.so")
 
 atb_op_manager = {}
-
 rope_seq_len_default = torch.ones([1], device="npu", dtype=torch.int32)
 
-atb_op = torch.classes.OperationTorch.OperationTorch("ATB")
 
 __all__ = [
     "add_rms_norm",
@@ -50,6 +48,7 @@ def linear(
     transpose_a: bool = False,
     transpose_b: bool = True,
 ) -> Tensor:
+    # linear 现在的设置还有点朴素简陋，其实LMDeploy所用到的Linear都是NT的，具体逻辑还有待改进
     if deqscale is not None:
         raise RuntimeError("linear does not support deqscale yet")
     has_bais = bias is not None
@@ -59,10 +58,10 @@ def linear(
         atb_op.set_param(json.dumps(params.__dict__))
         atb_op_manager["LinearOperation"] = atb_op
     if has_bais:
-        import pdb; pdb.set_trace()
         return atb_op_manager["LinearOperation"].execute([x, weight, bias])[0]
     else:
         return atb_op_manager["LinearOperation"].execute([x, weight])[0]
+
 
 @register_ops(vendor_ops_registry)
 def add_rms_norm(
@@ -98,7 +97,6 @@ def apply_rotary_pos_emb(
         sin = sin.unsqueeze(2)
             
     if "RopeOperation" not in atb_op_manager:
-        print("######### setting ROPE")
         params = RotaryParams(rotaryCoeff = 2)
         atb_op = torch.classes.OperationTorch.OperationTorch("RopeOperation")
         atb_op.set_param(json.dumps(params.__dict__))
@@ -111,10 +109,7 @@ def apply_rotary_pos_emb(
     cos_reshaped = cos.view(bsz * num_tokens, head_dim)
     sin_reshaped = sin.view(bsz * num_tokens, head_dim)
     atb_op_manager["RopeOperation"].execute_out([query_reshaped, key_reshaped, cos_reshaped, sin_reshaped, rope_seq_len_default], [query_reshaped, key_reshaped])
-    ropeQ_atb = query.view(bsz, num_tokens, num_q_heads, head_dim)
-    ropeK_atb = key.view(bsz, num_tokens, num_kv_heads, head_dim)
-
-    return ropeQ_atb, ropeK_atb
+    return query, key
 
 @dataclass 
 class PagedAttentionPrefillParams:
@@ -173,16 +168,14 @@ def prefill_attention_atb(query, key, value, q_seq_len,  num_q_heads, num_kv_hea
         atb_op_manager["SelfAttentionOperation"] = atb_op
         
     if attn_mask is not None:
-        if attn_mask.dtype != query.dtype:
-            attn_mask = attn_mask.to(query.dtype)
-        if q_seq_len.dtype != torch.int32:
-            q_seq_len = q_seq_len.to(torch.int32)
-        query = query.view(-1, num_q_heads * query.shape[-1])
-        key = key.view(-1, num_kv_heads * key.shape[-1])
-        value = value.view(-1, num_kv_heads * value.shape[-1])
+        query_reshaped = query.view(-1, num_q_heads * query.shape[-1])
+        key_reshaped = key.view(-1, num_kv_heads * key.shape[-1])
+        value_reshaped = value.view(-1, num_kv_heads * value.shape[-1])
         # mask要求f16/bf16, seq_len要求int32
-        atb_op_manager["SelfAttentionOperation"].execute_out_with_param([query, key, value, attn_mask],[attn_output], json.dumps({"seqLen": seq_len_list, "has_mask": True,}))
+        # 这里要用json.dumps传入cpu端的参数seq_len，具体见c++端 selfattention_host_tensor_binder.cc
+        atb_op_manager["SelfAttentionOperation"].execute_out_with_param([query_reshaped, key_reshaped, value_reshaped, attn_mask],[attn_output], json.dumps({"seqLen": seq_len_list, "has_mask": True,}))
     else:
+        # 这一个分支目前还没有case能够走到
         import pdb; pdb.set_trace()
         params = PagedAttentionPrefillParams(
         headNum=num_q_heads,
@@ -217,14 +210,12 @@ def fill_kv_cache(
     return key_cache, value_cache
 
 def fill_kv_cache_atb(key, value, key_cache, value_cache, kv_indices):
-    # kv_indices = kv_indices.flatten()
     if "ReshapeAndCacheOperation" not in atb_op_manager:
         atb_op = torch.classes.OperationTorch.OperationTorch("ReshapeAndCacheOperation")
         atb_op.set_param(json.dumps({}))
         atb_op_manager["ReshapeAndCacheOperation"] = atb_op
 
     atb_op_manager["ReshapeAndCacheOperation"].execute_out([key, value, key_cache, value_cache, kv_indices], [key_cache, value_cache])
-
 
 
 @register_ops(vendor_ops_registry)
@@ -284,7 +275,8 @@ def paged_decode_attentio_atb(query, key_cache, value_cache, block_table, block_
         params = PagedAttentionParams(headNum=num_q_heads, qkScale=1.0 / math.sqrt(head_dim), kvHeadNum=num_kv_heads)
         atb_op.set_param(json.dumps(params.__dict__))
         atb_op_manager["PagedAttentionOperation"] = atb_op
-    atb_op_manager["PagedAttentionOperation"].execute_out_with_param([query, key_cache_reshaped, value_cache_reshaped, block_table], [attn_output], json.dumps({"contextLen":contextLens, "has_mask":False}))    
+    # 这里的maskType=0，表示不使用mask, context_len也是cpu端的参数，需要通过host_tensor_binder传入    
+    atb_op_manager["PagedAttentionOperation"].execute_out_with_param([query, key_cache_reshaped, value_cache_reshaped, block_table], [attn_output], json.dumps({"contextLen":contextLens, "has_mask":False}))  
     return attn_output
 
 
@@ -345,9 +337,6 @@ def paged_prefill_attention_atb(
     key_cache_reshaped = key_cache.view(num_blocks, block_size, num_kv_heads, head_dim)
     value_cache_reshaped = value_cache.view(num_blocks, block_size, num_kv_heads, head_dim)
     contextLens = kv_seq_len.tolist()
-
-    if kv_seq_len.dtype != torch.int32:
-        kv_seq_len = kv_seq_len.to(torch.int32)
     atb_op_manager["PagedPrefillAttentionOperation"].execute_out_with_param([query, key_cache_reshaped, value_cache_reshaped, block_table, attn_mask], [attn_output], json.dumps({"contextLen":contextLens, "has_mask":True}))
     return attn_output
 
