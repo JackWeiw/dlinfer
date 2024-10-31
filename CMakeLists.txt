@@ -16,7 +16,7 @@ endif()
 set(DEVICE "" CACHE STRING "device string, default empty string")
 string(TOLOWER "${DEVICE}" DEVICE)
 
-list(APPEND SUPPORTED_DEVICE "ascend")
+list(APPEND SUPPORTED_DEVICE "ascend" "maca")
 
 if(NOT DEVICE)
   message(FATAL_ERROR "Please specify variable DEVICE of dlinfer!")
@@ -25,8 +25,4 @@ elseif(NOT DEVICE IN_LIST SUPPORTED_DEVICE)
 endif()
 
 add_subdirectory(dlinfer/vendor/${DEVICE})
-
-if("$ENV{DICP}" STREQUAL "true")
-  add_subdirectory(dlinfer/graph/dicp/vendor/AtbGraph/codegen/runtime)
-endif()
-
+add_subdirectory(dlinfer/graph/dicp/vendor)

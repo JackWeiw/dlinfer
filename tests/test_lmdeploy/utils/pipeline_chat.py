@@ -21,7 +21,7 @@ def run_pipeline_chat_test(
     cases_info,
     model_case,
     device_type,
-    extra: object = None,
+    eager_mode=True,
     use_local_model: bool = True,
 ):
     log_path = config.get("log_path")
@@ -32,7 +32,9 @@ def run_pipeline_chat_test(
         hf_path = model_path + "/" + model_case
     else:
         hf_path = model_case
-    backend_config = PytorchEngineConfig(tp=tp, device_type=device_type)
+    backend_config = PytorchEngineConfig(
+        tp=tp, device_type=device_type, eager_mode=eager_mode
+    )
     print("backend_config: ", backend_config)
     pipe = pipeline(hf_path, backend_config=backend_config)
 
@@ -179,14 +181,15 @@ PIC2 = (
 )
 
 
-def run_pipeline_vl_chat_test(config, model_case, device_type):
+def run_pipeline_vl_chat_test(config, model_case, device_type, eager_mode=True):
     log_path = config.get("log_path")
     tp = get_tp_num(config, model_case)
     model_path = config.get("model_path")
     hf_path = model_path + "/" + model_case
     backend_config = PytorchEngineConfig(
-        tp=tp, session_len=8192, device_type=device_type
+        tp=tp, session_len=8192, device_type=device_type, eager_mode=eager_mode
     )
+    print("backend_config: ", backend_config)
     pipe = pipeline(hf_path, backend_config=backend_config)
 
     pipeline_chat_log = os.path.join(
@@ -205,7 +208,7 @@ def run_pipeline_vl_chat_test(config, model_case, device_type):
         + response.text
         + "\n"
     )
-
+    print("### finish simple example")
     prompts = [
         {
             "role": "user",
@@ -224,7 +227,7 @@ def run_pipeline_vl_chat_test(config, model_case, device_type):
         + response.text
         + "\n"
     )
-
+    print("### finish OpenAI format example")
     image_urls = [PIC2, PIC1]
     images = [load_image(img_url) for img_url in image_urls]
     # test for multi batchs
@@ -242,7 +245,7 @@ def run_pipeline_vl_chat_test(config, model_case, device_type):
         + response.text
         + "\n"
     )
-
+    print("### finish Multi-images example")
     image_urls = [PIC2, PIC1]
     prompts = [(prompt, load_image(img_url)) for img_url in image_urls]
     response = pipe(prompts)
@@ -256,6 +259,7 @@ def run_pipeline_vl_chat_test(config, model_case, device_type):
         + str(response)
         + "\n"
     )
+    print("### finish Batch example")
     # test for conversation
     image = load_image(PIC2)
     sess = pipe.chat((prompt, image))
