@@ -13,6 +13,11 @@ vendor_dispatch_key_map = {
     "dcu": "CUDA",
 }
 
+cmake_install_target_map = {
+    "ascend": "install",
+    "maca": "install",
+    "dcu": "",
+}
 
 def gen_vendor_yaml(device):
     config = dict()
@@ -104,7 +109,7 @@ def main():
         package_data=get_package_data(),
         exclude_package_data={"": ["tests/*"]},
         cmake_args=get_cmake_args(),
-        cmake_install_target="",
+        cmake_install_target=cmake_install_target_map[get_device()],
         classifiers=[
             "Programming Language :: Python :: 3.8",
             "Programming Language :: Python :: 3.9",

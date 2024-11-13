@@ -24,7 +24,6 @@ __all__ = [
 ]
 
 
-
 @register_ops(vendor_ops_registry)
 def add_rms_norm(
     hidden_states: Tensor,
@@ -37,6 +36,7 @@ def add_rms_norm(
     output = rms_norm(new_states, weight, epsilon)
     return output, residual
 
+
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     half_size = x.shape[-1] // 2
@@ -46,6 +46,7 @@ def rotate_half(x):
     out[..., :half_size] = -x2
     out[..., half_size:] = x1
     return out
+
 
 @register_ops(vendor_ops_registry)
 def apply_rotary_pos_emb(
@@ -209,9 +210,8 @@ def rms_norm(
     x = hidden_states.to(torch.float32)
     variance = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(variance + epsilon)
-    x= weight * x.to(input_dtype)
+    x = weight * x.to(input_dtype)
     return x
-
 
 
 @register_ops(vendor_ops_registry)
