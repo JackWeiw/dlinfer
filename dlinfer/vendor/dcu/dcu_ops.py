@@ -32,6 +32,7 @@ def add_rms_norm(
     weight: Tensor,
     epsilon: float,
 ) -> Tuple[Tensor, Tensor]:
+    import pdb; pdb.set_trace()
     new_states = hidden_states + residual
     residual = new_states
     output = rms_norm(new_states, weight, epsilon)
@@ -56,15 +57,13 @@ def apply_rotary_pos_emb(
     position_ids: Optional[Tensor],
     cos_sin_cache: Optional[Tensor],
 ) -> Tuple[Tensor, Tensor]:
-    "inplace"
-    q_embed = query
-    k_embed = key
-    q_sin = rotate_half(query) * sin
-    q_embed.mul_(cos)
-    q_embed.add_(q_sin)
-    k_sin = rotate_half(key) * sin
-    k_embed.mul_(cos)
-    k_embed.add_(k_sin)
+    "not inplace"
+    query = query.contiguous()
+    key = key.contiguous()
+    import pdb; pdb.set_trace()
+    q_embed = (query * cos) + (rotate_half(query) * sin)
+    k_embed = (key * cos) + (rotate_half(key) * sin)
+    import pdb; pdb.set_trace()
     return q_embed, k_embed
 
 
@@ -83,15 +82,17 @@ def prefill_attention(
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
 ) -> Tensor:
+    import pdb; pdb.set_trace()
     if q_seq_len is None:
         q_seq_len = max_q_seq_len
     kv_seq_len = q_seq_len
     max_kv_seq_len = max_q_seq_len
-
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
     causal = True
     if softmax_scale is None:
         softmax_scale = float(1 / math.sqrt(key.size(-1)))
-
     output = flash_attn_varlen_func(
         query,
         key,
@@ -104,6 +105,7 @@ def prefill_attention(
         causal=causal,
         window_size=(-1, -1),
     )
+    import pdb; pdb.set_trace()
     return output
 
 
@@ -115,14 +117,18 @@ def fill_kv_cache(
     value_cache: Tensor,
     kv_indices: Tensor,
 ) -> Tuple[Tensor, Tensor]:
+    import pdb; pdb.set_trace()
     kv_indices = kv_indices.flatten()
-    block_num, num_heads, block_size, head_size = key_cache.shape
+    key = key.contiguous()
+    value = value.contiguous()
+    block_num, block_size, num_heads, head_size = key_cache.shape
     for i in range(kv_indices.size(0)):
         slot_idx = kv_indices[i]
         block_idx = slot_idx // block_size
         block_offset = slot_idx % block_size
-        key_cache[block_idx, :, block_offset] = key[i]
-        value_cache[block_idx, :, block_offset] = value[i]
+        key_cache[block_idx, block_offset] = key[i]
+        value_cache[block_idx, block_offset] = value[i]
+    import pdb; pdb.set_trace()
     return key_cache, value_cache
 
 
@@ -143,30 +149,27 @@ def paged_decode_attention(
 ) -> Tensor:
     if alibi_slopes is not None:
         raise RuntimeError("paged_decode_attention does not support alibi_slopes yet")
-
+    query = query.contiguous()
     dim = query.size(-1)
     num_kv_heads = value_cache.size(1)
     block_size = value_cache.size(2)
     batch_size = block_table.size(0)
-
-    key_cache_t = key_cache.transpose(1, 2)
-    value_cache_t = value_cache.transpose(1, 2)
-
+    import pdb; pdb.set_trace()
     if softmax_scale is None:
         softmax_scale = float(1 / math.sqrt(query.size(-1)))
 
     block_table = block_table.to(torch.int32)
     kv_seq_len = kv_seq_len.to(torch.int32).to(query.device)
-
     output = flash_attn_with_kvcache(
         query.view(batch_size, -1, num_q_heads, dim),
-        key_cache_t,
-        value_cache_t,
+        key_cache,
+        value_cache,
         cache_seqlens=kv_seq_len,
         block_table=block_table,
         softmax_scale=softmax_scale,
         causal=True,
     )
+    import pdb; pdb.set_trace()
     return output
 
 
@@ -187,6 +190,7 @@ def paged_prefill_attention(
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
 ) -> Tensor:
+    import pdb; pdb.set_trace()
     dim = query.size(-1)
     batch_size = block_table.size(0)
 
@@ -213,19 +217,24 @@ def rms_norm(
     weight: Tensor,
     epsilon: float,
 ) -> Tensor:
+    hidden_states = hidden_states.contiguous()
+    import pdb; pdb.set_trace()
     input_dtype = hidden_states.dtype
     x = hidden_states.to(torch.float32)
     variance = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(variance + epsilon)
     x= weight * x.to(input_dtype)
+    import pdb; pdb.set_trace()
     return x
 
 
 
 @register_ops(vendor_ops_registry)
 def silu_and_mul(x: Tensor, dim: int = -1) -> Tensor:
+    import pdb; pdb.set_trace()
     gate, up = x.chunk(2, dim)
-    output = F.silu(gate)*up
+    output = F.silu(gate) * up
+    import pdb; pdb.set_trace()
     return output
 
 
@@ -236,6 +245,7 @@ def linear(
     bias: Optional[Tensor],
     all_reduce: Optional[bool],
 ) -> Tensor:
+    import pdb; pdb.set_trace()
     out = torch.nn.functional.linear(x, weight, bias)
     if all_reduce:
         dist.all_reduce(out)
