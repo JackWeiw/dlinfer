@@ -1,2 +1,2 @@
-torch==2.3.0+das.opt1.dtk24042
-torchvision==2.1.2+das.opt2.dtk24042
+# torch==2.3.0+das.opt1.dtk24042
+# torchvision==2.1.2+das.opt2.dtk24042

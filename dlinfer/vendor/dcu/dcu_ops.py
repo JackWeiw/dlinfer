@@ -115,10 +115,14 @@ def fill_kv_cache(
     value_cache: Tensor,
     kv_indices: Tensor,
 ) -> Tuple[Tensor, Tensor]:
-    kv_indices = kv_indices.squeeze(-1)
-    maca_ext_ops.reshape_and_cache_new(
-        key, value, key_cache, value_cache, kv_indices, "auto", 1.0, 1.0
-    )
+    kv_indices = kv_indices.flatten()
+    block_num, num_heads, block_size, head_size = key_cache.shape
+    for i in range(kv_indices.size(0)):
+        slot_idx = kv_indices[i]
+        block_idx = slot_idx // block_size
+        block_offset = slot_idx % block_size
+        key_cache[block_idx, :, block_offset] = key[i]
+        value_cache[block_idx, :, block_offset] = value[i]
     return key_cache, value_cache
 
 
@@ -210,7 +214,7 @@ def rms_norm(
     epsilon: float,
 ) -> Tensor:
     input_dtype = hidden_states.dtype
-    x = input_dtype.to(torch.float32)
+    x = hidden_states.to(torch.float32)
     variance = x.pow(2).mean(-1, keepdim=True)
     x = x * torch.rsqrt(variance + epsilon)
     x= weight * x.to(input_dtype)

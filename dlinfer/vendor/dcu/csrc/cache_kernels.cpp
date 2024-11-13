@@ -1,6 +1,7 @@
+#include "hip/hip_runtime.h"
 // 2024 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
 #include <torch/all.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/HIPContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
 #include "cuda_compat.h"
@@ -19,134 +20,10 @@
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
+  #include "hip/hip_runtime.h"
+  #include <hip/hip_runtime.h>
 typedef __hip_bfloat16 __nv_bfloat16;
 #endif
-
-void swap_blocks(torch::Tensor& src, torch::Tensor& dst,
-                 const torch::Tensor& block_mapping) {
-  torch::Device src_device = src.device();
-  torch::Device dst_device = dst.device();
-  cudaMemcpyKind memcpy_type;
-  if (src_device.is_cuda() && dst_device.is_cuda()) {
-    TORCH_CHECK(src_device.index() == dst_device.index(),
-                "src and dst must be on the same GPU");
-    memcpy_type = cudaMemcpyDeviceToDevice;
-  } else if (src_device.is_cuda() && dst_device.is_cpu()) {
-    memcpy_type = cudaMemcpyDeviceToHost;
-  } else if (src_device.is_cpu() && dst_device.is_cuda()) {
-    memcpy_type = cudaMemcpyHostToDevice;
-  } else {
-    TORCH_CHECK(false, "Invalid device combination");
-  }
-
-  // NOTE(youkaichao): keep in mind that `block_mapping` should be
-  // a cpu tensor, otherwise every `item` call will require a gpu-cpu
-  // synchronization.
-  TORCH_CHECK(block_mapping.device().is_cpu(), "block_mapping must be on CPU");
-
-  char* src_ptr = static_cast<char*>(src.data_ptr());
-  char* dst_ptr = static_cast<char*>(dst.data_ptr());
-
-  const int64_t block_size_in_bytes = src.element_size() * src[0].numel();
-  const at::cuda::OptionalCUDAGuard device_guard(
-      src_device.is_cuda() ? src_device : dst_device);
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  // NOTE(woosuk): This can be slow if the number of blocks is large.
-  const int64_t num_blocks = block_mapping.size(0);
-  for (size_t i = 0; i < num_blocks; i++) {
-    int64_t src_block_number = block_mapping[i][0].item<int64_t>();
-    int64_t dst_block_number = block_mapping[i][1].item<int64_t>();
-    int64_t src_offset = src_block_number * block_size_in_bytes;
-    int64_t dst_offset = dst_block_number * block_size_in_bytes;
-    cudaMemcpyAsync(dst_ptr + dst_offset, src_ptr + src_offset,
-                    block_size_in_bytes, memcpy_type, stream);
-  }
-}
-
-namespace vllm {
-
-// Grid: (num_layers, num_pairs)
-template <typename scalar_t>
-__global__ void copy_blocks_kernel(int64_t* key_cache_ptrs,
-                                   int64_t* value_cache_ptrs,
-                                   const int64_t* __restrict__ block_mapping,
-                                   const int numel_per_block) {
-  const int layer_idx = blockIdx.x;
-  const int pair_idx = blockIdx.y;
-
-  scalar_t* key_cache = reinterpret_cast<scalar_t*>(key_cache_ptrs[layer_idx]);
-  scalar_t* value_cache =
-      reinterpret_cast<scalar_t*>(value_cache_ptrs[layer_idx]);
-  int64_t src_block_number = block_mapping[2 * pair_idx];
-  int64_t dst_block_number = block_mapping[2 * pair_idx + 1];
-
-  const int64_t src_block_offset = src_block_number * numel_per_block;
-  const int64_t dst_block_offset = dst_block_number * numel_per_block;
-  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
-    int64_t src_offset = src_block_offset + i;
-    int64_t dst_offset = dst_block_offset + i;
-    key_cache[dst_offset] = key_cache[src_offset];
-  }
-  for (int i = threadIdx.x; i < numel_per_block; i += blockDim.x) {
-    int64_t src_offset = src_block_offset + i;
-    int64_t dst_offset = dst_block_offset + i;
-    value_cache[dst_offset] = value_cache[src_offset];
-  }
-}
-
-}  // namespace vllm
-
-// Note: the key_caches and value_caches vectors are constant but
-// not the Tensors they contain. The vectors need to be const refs
-// in order to satisfy pytorch's C++ operator registration code.
-void copy_blocks(std::vector<torch::Tensor> const& key_caches,
-                 std::vector<torch::Tensor> const& value_caches,
-                 const torch::Tensor& block_mapping) {
-  int num_layers = key_caches.size();
-  TORCH_CHECK(num_layers == value_caches.size());
-  if (num_layers == 0) {
-    return;
-  }
-  torch::Device cache_device = key_caches[0].device();
-  TORCH_CHECK(cache_device.is_cuda());
-
-  // Create data structures for the kernel.
-  // Create an array of pointers to the key and value caches.
-  int64_t key_cache_ptrs[num_layers];
-  int64_t value_cache_ptrs[num_layers];
-  for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-    key_cache_ptrs[layer_idx] =
-        reinterpret_cast<int64_t>(key_caches[layer_idx].data_ptr());
-    value_cache_ptrs[layer_idx] =
-        reinterpret_cast<int64_t>(value_caches[layer_idx].data_ptr());
-  }
-
-  // block_mapping is a 2D tensor with shape (num_pairs, 2).
-  int num_pairs = block_mapping.size(0);
-
-  // Move the data structures to the GPU.
-  // NOTE: This synchronizes the CPU and GPU.
-  torch::Tensor key_cache_ptrs_tensor =
-      torch::from_blob(key_cache_ptrs, {num_layers}, torch::kInt64)
-          .to(cache_device);
-  torch::Tensor value_cache_ptrs_tensor =
-      torch::from_blob(value_cache_ptrs, {num_layers}, torch::kInt64)
-          .to(cache_device);
-
-  // Launch the kernel.
-  const int numel_per_block = key_caches[0][0].numel();
-  dim3 grid(num_layers, num_pairs);
-  dim3 block(std::min(1024, numel_per_block));
-  const at::cuda::OptionalCUDAGuard device_guard(cache_device);
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  VLLM_DISPATCH_FLOATING_AND_BYTE_TYPES(
-      key_caches[0].scalar_type(), "copy_blocks_kernel", ([&] {
-        vllm::copy_blocks_kernel<scalar_t><<<grid, block, 0, stream>>>(
-            key_cache_ptrs_tensor.data_ptr<int64_t>(),
-            value_cache_ptrs_tensor.data_ptr<int64_t>(),
-            block_mapping.data_ptr<int64_t>(), numel_per_block);
-      }));
-}
 
 namespace vllm {
 
@@ -412,7 +289,7 @@ void reshape_and_cache(
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE)
@@ -471,7 +348,7 @@ void reshape_and_cache_new(
   dim3 grid(num_tokens);
   dim3 block(std::min(num_heads * head_size, 512));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
-  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const hipStream_t stream = at::cuda::getCurrentCUDAStream();
   
   if (kv_cache_dtype == "auto") {
     if (key.dtype() == at::ScalarType::Float) {
