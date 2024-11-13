@@ -182,15 +182,12 @@ def paged_prefill_attention(
     dim = query.size(-1)
     batch_size = block_table.size(0)
 
-    key_cache_t = key_cache.transpose(1, 2)
-    value_cache_t = value_cache.transpose(1, 2)
-
     if softmax_scale is None:
         softmax_scale = float(1 / math.sqrt(query.size(-1)))
     output = flash_attn_with_kvcache(
         query.view(batch_size, -1, num_q_heads, dim),
-        key_cache_t,
-        value_cache_t,
+        key_cache,
+        value_cache,
         cache_seqlens=kv_seq_len.to(torch.int32).to(query.device),
         block_table=block_table.to(torch.int32),
         softmax_scale=softmax_scale,
