@@ -115,7 +115,7 @@ def fill_kv_cache(
     kv_indices = kv_indices.flatten()
     key = key.contiguous()
     value = value.contiguous()
-    block_num, block_size, num_heads, head_size = key_cache.shape
+    _, block_size, _, _ = key_cache.shape
     for i in range(kv_indices.size(0)):
         slot_idx = kv_indices[i]
         block_idx = slot_idx // block_size
