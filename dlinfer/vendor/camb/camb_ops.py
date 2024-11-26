@@ -79,31 +79,13 @@ def apply_rotary_pos_emb(
     position_ids: Optional[Tensor],
     cos_sin_cache: Optional[Tensor],
 ) -> Tuple[Tensor, Tensor]:
-    assert query.ndim == 3, "only support q:[totalSeq, head ,head_dim]"
-    assert key.ndim == 3, "only support k:[totalSeq, head ,head_dim]"
-    interleaved = False
-    max_context_len = query.shape[0]
-
-    total_seq_len, q_head_num, head_dim = query.shape
-    k_head_num = key.shape[1]
-
-    # another version
-    # cu_seqlens = position_ids
-    # query = tmo.apply_rotary(query, sin, cos, None, cu_seqlens, interleaved, False, False, total_seq_len)
-    # key = tmo.apply_rotary(key, sin, cos, None, cu_seqlens, interleaved, False, False, total_seq_len)
-
-    query = query.reshape(total_seq_len, 1, q_head_num, head_dim)
-    key = key.reshape(total_seq_len, 1, k_head_num, head_dim)
-    sin = sin.reshape(total_seq_len, 1, head_dim)
-    cos = cos.reshape(total_seq_len, 1, head_dim)  
-
-    query = tmo.apply_rotary(query, sin, cos, None, None, interleaved, False, True, 1)
-    key = tmo.apply_rotary(key, sin, cos, None, None, interleaved, False, True, 1)
-
-    query = query.view(total_seq_len, q_head_num, head_dim)
-    key = key.view(total_seq_len, k_head_num, head_dim)
-
-    return query, key
+    interleaved = False # False for fold rope, True for cross rope
+    _, total_seq_len, _, head_dim = query.shape # [1, total_seq_len, q_head_num, head_dim]
+    sin_reshaped = sin.view(total_seq_len, head_dim)
+    cos_reshaped = cos.view(total_seq_len, head_dim)  
+    q_embed = tmo.apply_rotary(query, sin_reshaped, cos_reshaped, None, None, interleaved, False, False, total_seq_len)
+    k_embed = tmo.apply_rotary(key, sin_reshaped, cos_reshaped, None, None, interleaved, False, False, total_seq_len)
+    return q_embed, k_embed
 
 @register_ops(vendor_ops_registry)
 def fill_kv_cache(
@@ -113,15 +95,8 @@ def fill_kv_cache(
     value_cache: Tensor,
     kv_indices: Tensor,
 ) -> Tuple[Tensor, Tensor]:
-    assert key.ndim == 3 and value.ndim == 3, \
-        "only support key, value: [total_seq_len, head_num, head_size]"
-    assert key_cache.ndim == 4 and value_cache.ndim == 4, \
-        "only support key_cache, value_cache: [block_num, head_num, block_size, head_size]"
-    assert kv_indices.ndim == 1, "only support kv_indices: [total_seq_len]"
-    assert kv_indices.dtype == torch.int32, "kv_indices must be torch.int32"
-
+    kv_indices = kv_indices.flatten()
     tmo.reshape_paged_cache(key, value, key_cache, value_cache, kv_indices)
-
     return key_cache, value_cache
 
 @register_ops(vendor_ops_registry)
@@ -132,6 +107,8 @@ def prefill_attention(
     q_start_loc: Tensor, # cu_seqlens
     q_seq_len: Tensor,
     max_q_seq_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
     attn_mask: Sequence[Optional[Tensor]],
     softmax_scale: Optional[float],
     alibi_slopes: Optional[Sequence[float]],
@@ -141,11 +118,13 @@ def prefill_attention(
         alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
     if softmax_scale is None:
         softmax_scale = 1. / math.sqrt(query.shape[-1]) 
-
-    tmo.flash_attention(query, key, value, attn_output, q_start_loc, q_start_loc, alibi_slopes, 
-                        None, max_q_seq_len, max_q_seq_len, softmax_scale, True, -1, -1, query.dtype, False)
-
-    return attn_output
+    max_kv_seq_len = max_q_seq_len
+    CASUAL =True
+    if attn_output is not None and attn_output.data_ptr() == query.data_ptr():
+        attn_output = None
+    out = tmo.flash_attention(query, key, value, attn_output, q_start_loc, q_start_loc, alibi_slopes, 
+                    None, max_q_seq_len, max_kv_seq_len, softmax_scale, CASUAL, -1, -1, torch.float, False)
+    return out
 
 @register_ops(vendor_ops_registry)
 def paged_decode_attention(
@@ -156,6 +135,8 @@ def paged_decode_attention(
     block_size: int,
     kv_seq_len: Tensor,
     max_kv_seq_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
     softmax_scale: Optional[float],
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
@@ -185,6 +166,7 @@ def paged_decode_attention(
 
 @register_ops(vendor_ops_registry)
 def moe_gating_topk_softmax(router_logits: Tensor, topk: int) -> Tuple[Tensor, Tensor]:
+    import pdb; pdb.set_trace()
     routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
     routing_weights, selected_experts = torch.topk(routing_weights, topk, dim=-1)
     # return routing_weights, selected_experts
