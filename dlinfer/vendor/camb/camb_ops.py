@@ -27,6 +27,7 @@ __all__ =[
 def silu_and_mul(input_tensor: Tensor, dim: int) -> Tensor:
     return tmo.active(input_tensor, act_mode="silu", is_gated=True)
 
+
 @register_ops(vendor_ops_registry)
 def rms_norm(
     hidden_states: Tensor,
@@ -45,6 +46,7 @@ def rms_norm(
         normed_hidden_states = tmo.fused_rms_norm(hidden_states, None, weight, None, None, epsilon, store_output_before_norm, None, None)
         normed_hidden_states = normed_hidden_states.view(original_shape)
         return normed_hidden_states
+
 
 @register_ops(vendor_ops_registry)
 def add_rms_norm(
@@ -70,6 +72,7 @@ def add_rms_norm(
         added_hidden_states = added_hidden_states.view(original_shape)
     return normed_hidden_states, added_hidden_states
 
+
 @register_ops(vendor_ops_registry)
 def apply_rotary_pos_emb(
     query: Tensor,
@@ -79,31 +82,14 @@ def apply_rotary_pos_emb(
     position_ids: Optional[Tensor],
     cos_sin_cache: Optional[Tensor],
 ) -> Tuple[Tensor, Tensor]:
-    assert query.ndim == 3, "only support q:[totalSeq, head ,head_dim]"
-    assert key.ndim == 3, "only support k:[totalSeq, head ,head_dim]"
-    interleaved = False
-    max_context_len = query.shape[0]
-  
-    total_seq_len, q_head_num, head_dim = query.shape
-    k_head_num = key.shape[1]
+    interleaved = False # False for fold rope, True for cross rope
+    _, total_seq_len, _, head_dim = query.shape # [1, total_seq_len, q_head_num, head_dim]
+    sin_reshaped = sin.view(total_seq_len, head_dim)
+    cos_reshaped = cos.view(total_seq_len, head_dim)  
+    q_embed = tmo.apply_rotary(query, sin_reshaped, cos_reshaped, None, None, interleaved, False, False, total_seq_len)
+    k_embed = tmo.apply_rotary(key, sin_reshaped, cos_reshaped, None, None, interleaved, False, False, total_seq_len)
+    return q_embed, k_embed
 
-    # another version
-    # cu_seqlens = position_ids
-    # query = tmo.apply_rotary(query, sin, cos, None, cu_seqlens, interleaved, False, False, total_seq_len)
-    # key = tmo.apply_rotary(key, sin, cos, None, cu_seqlens, interleaved, False, False, total_seq_len)
-
-    query = query.reshape(total_seq_len, 1, q_head_num, head_dim)
-    key = key.reshape(total_seq_len, 1, k_head_num, head_dim)
-    sin = sin.reshape(total_seq_len, 1, head_dim)
-    cos = cos.reshape(total_seq_len, 1, head_dim)  
-    
-    query = tmo.apply_rotary(query, sin, cos, None, None, interleaved, False, True, 1)
-    key = tmo.apply_rotary(key, sin, cos, None, None, interleaved, False, True, 1)
-
-    query = query.view(total_seq_len, q_head_num, head_dim)
-    key = key.view(total_seq_len, k_head_num, head_dim)
-
-    return query, key
 
 @register_ops(vendor_ops_registry)
 def fill_kv_cache(
@@ -121,8 +107,9 @@ def fill_kv_cache(
     assert kv_indices.dtype == torch.int32, "kv_indices must be torch.int32"
 
     tmo.reshape_paged_cache(key, value, key_cache, value_cache, kv_indices)
-
+    
     return key_cache, value_cache
+
 
 @register_ops(vendor_ops_registry)
 def prefill_attention(
@@ -132,6 +119,8 @@ def prefill_attention(
     q_start_loc: Tensor, # cu_seqlens
     q_seq_len: Tensor,
     max_q_seq_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
     attn_mask: Sequence[Optional[Tensor]],
     softmax_scale: Optional[float],
     alibi_slopes: Optional[Sequence[float]],
@@ -156,6 +145,8 @@ def paged_decode_attention(
     block_size: int,
     kv_seq_len: Tensor,
     max_kv_seq_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
     softmax_scale: Optional[float],
     alibi_slopes: Optional[Sequence[float]],
     attn_output: Optional[Tensor],
