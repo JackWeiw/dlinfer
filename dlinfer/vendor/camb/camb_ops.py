@@ -130,11 +130,13 @@ def prefill_attention(
         alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
     if softmax_scale is None:
         softmax_scale = 1. / math.sqrt(query.shape[-1]) 
-
-    tmo.flash_attention(query, key, value, attn_output, q_start_loc, q_start_loc, alibi_slopes, 
+    # flash_attention dosen't support in-place operation, so we need to check if attn_output.data_ptr() == query.data_ptr()
+    if attn_output is not None and attn_output.data_ptr() == query.data_ptr():
+        attn_output = None
+    out = tmo.flash_attention(query, key, value, attn_output, q_start_loc, q_start_loc, alibi_slopes, 
                         None, max_q_seq_len, max_q_seq_len, softmax_scale, True, -1, -1, query.dtype, False)
 
-    return attn_output
+    return out
 
 @register_ops(vendor_ops_registry)
 def paged_decode_attention(
@@ -182,8 +184,11 @@ def paged_prefill_attention(
     block_table: Tensor,
     block_size: int,
     q_start_loc: Tensor,
+    cu_seq_lens_kv: Tensor,
     q_seq_len: Tensor,
     kv_seq_len: Tensor,
+    max_q_seq_len: int,
+    max_kv_seq_len: int,
     num_q_heads: int,
     num_kv_heads: int,
     attn_mask: Sequence[Optional[Tensor]],
@@ -193,18 +198,19 @@ def paged_prefill_attention(
 ) -> Tensor:
     if softmax_scale is None:
         softmax_scale = float(1 / math.sqrt(query.size(-1)))
-    cu_seq_lens_kv = torch.cat((torch.tensor([0], device=kv_seq_len.device), kv_seq_len.cumsum(0))).int()    
+    if attn_output is not None and attn_output.data_ptr() == query.data_ptr():
+        attn_output = None   
     output = tmo.flash_attention(
         query,
         key_cache,
         value_cache,
-        None,
+        attn_output,
         q_start_loc,
         cu_seq_lens_kv,
         alibi_slopes,
         None,
-        max_seq_len_q = torch.max(q_seq_len),
-        max_seq_len_kv = torch.max(kv_seq_len),
+        max_seq_len_q = max_q_seq_len,
+        max_seq_len_kv = max_kv_seq_len,
         softmax_scale=softmax_scale,
         is_causal=True,
         block_tables=block_table,
