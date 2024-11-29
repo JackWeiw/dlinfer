@@ -15,7 +15,7 @@ __all__ =[
     "prefill_attention",
     "fill_kv_cache",
     "paged_decode_attention",
-    # "paged_prefill_attention",
+    "paged_prefill_attention",
     "rms_norm",
     "moe_gating_topk_softmax",
     "fused_moe",
@@ -173,6 +173,43 @@ def paged_decode_attention(
     
     attn_output = attn_output.reshape(total_seq_len, head_num, head_dim)
     return attn_output
+
+@register_ops(vendor_ops_registry)
+def paged_prefill_attention(
+    query: Tensor,
+    key_cache: Tensor,
+    value_cache: Tensor,
+    block_table: Tensor,
+    block_size: int,
+    q_start_loc: Tensor,
+    q_seq_len: Tensor,
+    kv_seq_len: Tensor,
+    num_q_heads: int,
+    num_kv_heads: int,
+    attn_mask: Sequence[Optional[Tensor]],
+    softmax_scale: Optional[float],
+    alibi_slopes: Optional[Sequence[float]],
+    attn_output: Optional[Tensor],
+) -> Tensor:
+    if softmax_scale is None:
+        softmax_scale = float(1 / math.sqrt(query.size(-1)))
+    cu_seq_lens_kv = torch.cat((torch.tensor([0], device=kv_seq_len.device), kv_seq_len.cumsum(0))).int()    
+    output = tmo.flash_attention(
+        query,
+        key_cache,
+        value_cache,
+        None,
+        q_start_loc,
+        cu_seq_lens_kv,
+        alibi_slopes,
+        None,
+        max_seq_len_q = torch.max(q_seq_len),
+        max_seq_len_kv = torch.max(kv_seq_len),
+        softmax_scale=softmax_scale,
+        is_causal=True,
+        block_tables=block_table,
+    )
+    return output
 
 @register_ops(vendor_ops_registry)
 def moe_gating_topk_softmax(router_logits: Tensor, topk: int) -> Tuple[Tensor, Tensor]:
