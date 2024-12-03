@@ -1,7 +1,6 @@
 # Copyright (c) 2024, DeepLink. All rights reserved.
 import math
 import torch
-import torch_npu
 
 from dlinfer.vendor import vendor_ops_registry
 from dlinfer.utils.registry import register_ops
@@ -177,6 +176,7 @@ def paged_decode_attention(
 
     bs, _, dim = query.shape
     query = query.contiguous()
+    attn_output = attn_output.contiguous()
     query = query.view(bs, 1, num_q_heads * dim)
     scale_value = 1.0 / math.sqrt(dim)
 
@@ -284,9 +284,10 @@ def moe_gating_topk_softmax(router_logits: Tensor, topk: int) -> Tuple[Tensor, T
         (*router_logits.shape[:-1], topk), dtype=torch.int32
     )
     selected_idx = torch.empty_like(selected_experts)
-    return torch.ops.npu_ext.npu_moe_gating_topk_softmax(
+    routing_weights, selected_idx = torch.ops.npu_ext.npu_moe_gating_topk_softmax(
         router_logits, None, topk, routing_weights, selected_experts, selected_idx
     )
+    return routing_weights, selected_idx.to(torch.int64)
 
 
 # TODO only for internlm in transformers lib.
@@ -373,7 +374,12 @@ def weight_quant_matmul(
 ) -> Tensor:
     offset = None if (offset is None or offset.numel() == 0) else offset
     return torch.ops.npu.npu_weight_quant_batchmatmul(
-        x, qweight, scale, antiquant_offset=offset, antiquant_group_size=group_size
+        x,
+        qweight,
+        scale,
+        antiquant_offset=offset,
+        antiquant_group_size=group_size,
+        bias=bias,
     )
 
 
@@ -407,7 +413,6 @@ def fused_moe(
             down_proj = torch.matmul(down_weight, gate_cache)
 
             moe_output[i] += weight * down_proj
-
     return moe_output
 
 

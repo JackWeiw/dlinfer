@@ -1,5 +1,7 @@
+import os
 import math
 import torch
+import torch.distributed as dist
 
 from flash_attn import flash_attn_varlen_func
 from flash_attn import flash_attn_with_kvcache
@@ -21,6 +23,7 @@ __all__ = [
     "rms_norm",
     "silu_and_mul",
     "moe_gating_topk_softmax",
+    "linear",
 ]
 
 
@@ -69,11 +72,9 @@ def apply_rotary_pos_emb(
 ) -> Tuple[Tensor, Tensor]:
     position_ids_1d = torch.arange(0, query.size(1), device=query.device)
     head_size = query.size(-1)
-    rot_dim = cos.size(-1) // 2
     query = query.flatten(-2, -1)
     key = key.flatten(-2, -1)
-    cos = cos[..., :rot_dim]
-    sin = sin[..., :rot_dim]
+    rot_dim = cos.size(-1)
 
     maca_ext_ops.rotary_embedding(
         position_ids_1d,
@@ -369,3 +370,21 @@ def fused_moe(
         out.view(N, -1, down_weights.shape[1])
         * topk_weights.view(N, -1, 1).to(out.dtype)
     ).sum(dim=1)
+
+
+@register_ops(vendor_ops_registry)
+def linear(
+    x: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    all_reduce: Optional[bool],
+) -> Tensor:
+    if os.getenv("MACA_USE_NN_LAYOUT", "True").lower() == "true":
+        out = torch.matmul(x, weight)
+        if bias is not None:
+            out += bias
+    else:
+        out = torch.nn.functional.linear(x, weight, bias)
+    if all_reduce:
+        dist.all_reduce(out)
+    return out
