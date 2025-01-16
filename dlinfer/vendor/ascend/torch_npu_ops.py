@@ -28,6 +28,7 @@ def add_rms_norm(
     residual: Tensor,
     weight: Tensor,
     epsilon: float,
+    quant_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
     normed_hidden_states, _, added_hidden_states = torch.ops.npu.npu_add_rms_norm(
         hidden_states, residual, weight, epsilon
@@ -289,7 +290,12 @@ def paged_prefill_attention(
 
 
 @register_ops(vendor_ops_registry)
-def rms_norm(hidden_states: Tensor, weight: Tensor, epsilon: float) -> Tensor:
+def rms_norm(
+    hidden_states: Tensor,
+    weight: Tensor,
+    epsilon: float,
+    quant_dtype: Optional[torch.dtype] = None,
+) -> Tensor:
     hidden_states = hidden_states.contiguous()
     return torch.ops.npu.npu_rms_norm(hidden_states, weight, epsilon)[0]
 

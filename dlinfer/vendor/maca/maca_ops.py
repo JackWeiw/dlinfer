@@ -59,6 +59,7 @@ def add_rms_norm(
     residual: Tensor,
     weight: Tensor,
     epsilon: float,
+    quant_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
     custom_ops.fused_add_rms_norm(hidden_states, residual, weight, epsilon)
     return hidden_states, residual
@@ -303,6 +304,7 @@ def rms_norm(
     hidden_states: Tensor,
     weight: Tensor,
     epsilon: float,
+    quant_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     output = torch.empty_like(hidden_states)
     custom_ops.rms_norm(output, hidden_states, weight, epsilon)

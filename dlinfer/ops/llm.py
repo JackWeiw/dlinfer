@@ -21,6 +21,8 @@ __all__ = [
     "weight_quant_matmul",
     "fused_moe",
     "linear",
+    "per_token_quant_int8",
+    "smooth_quant_matmul",
 ]
 
 
@@ -30,6 +32,7 @@ def add_rms_norm(
     residual: Tensor,
     weight: Tensor,
     epsilon: float,
+    quant_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor]:
     """
     Add the residual connection and then apply Root Mean Square (RMS) Normalization.
@@ -39,13 +42,15 @@ def add_rms_norm(
         residual (Tensor): The residual tensor to be added to the hidden states.
         weight (Tensor): The weight tensor used for normalization.
         epsilon (float): A small constant added to the root mean square to prevent division by zero.
-
+        quant_dtype: Optional[torch.dtype]: The quantization data type.
     Returns:
         Tuple[Tensor, Tensor]:
             - The normalized output tensor.
             - The added result of the residual connection.
     """
-    return vendor_ops_registry["add_rms_norm"](hidden_states, residual, weight, epsilon)
+    return vendor_ops_registry["add_rms_norm"](
+        hidden_states, residual, weight, epsilon, quant_dtype
+    )
 
 
 @register_custom_op("dlinfer::apply_rotary_pos_emb", ["query", "key"])
@@ -370,6 +375,7 @@ def rms_norm(
     hidden_states: Tensor,
     weight: Tensor,
     epsilon: float,
+    quant_dtype: Optional[torch.dtype] = None,
 ) -> Tensor:
     """
     Apply Root Mean Square (RMS) Normalization to the input.
@@ -378,11 +384,12 @@ def rms_norm(
         hidden_states (Tensor): The input tensor to be normalized.
         weight (Tensor): The weight tensor used for normalization.
         epsilon (float): A small constant added to the root mean square to prevent division by zero.
+        quant_dtype: Optional[torch.dtype]: The quantization data type.
 
     Returns:
         Tensor: The normalized output tensor.
     """
-    return vendor_ops_registry["rms_norm"](hidden_states, weight, epsilon)
+    return vendor_ops_registry["rms_norm"](hidden_states, weight, epsilon, quant_dtype)
 
 
 def silu_and_mul_impl_abstract_func(
@@ -613,3 +620,50 @@ def linear(
         Tensor: The output tensor of linear computation.
     """
     return vendor_ops_registry["linear"](x, weight, bias, all_reduce)
+
+
+def per_token_quant_int8(
+    x: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Function to perform per-token quantization on an input tensor `x`.
+    It converts the tensor values into signed 8-bit integers and returns the
+    quantized tensor along with the scaling factor used for quantization.
+
+    Args:
+        x (Tensor):  The tensor to be quantized.
+
+    Returns:
+        Tuple[Tensor, Tensor]:
+        quantized_x: int8-tensor with the same shape of x.
+        scale: float-tensor with the shape of x.shape[0:-1].
+    """
+    return vendor_ops_registry["per_token_quant_int8"](x)
+
+
+def smooth_quant_matmul(
+    a: Tensor,
+    a_scale: Optional[Tensor],
+    b: Tensor,
+    b_scale: Optional[Tensor],
+    out_dtype: torch.dtype,
+    bias: Tensor,
+    all_reduce: bool = False,
+) -> Tensor:
+    """Perform smooth quantized matrix multiplication on tensor a and b.
+
+    Args:
+        a (Tensor): _description_
+        a_scale (Optional[Tensor]): _description_
+        b (Tensor): _description_
+        b_scale (Optional[Tensor]): _description_
+        out_dtype (torch.dtype): _description_
+        bias (Tensor): _description_
+        all_reduce (bool, optional): _description_. Defaults to False.
+
+    Returns:
+        Tensor: _description_
+    """
+    return vendor_ops_registry["smooth_quant_matmul"](
+        a, a_scale, b, b_scale, out_dtype, bias, all_reduce
+    )

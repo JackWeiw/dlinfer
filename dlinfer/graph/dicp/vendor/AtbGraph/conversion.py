@@ -94,7 +94,7 @@ class AtenToAtbTransformer(SingleOpTransformer):
         return self.get_proxy(atb_op.GetItem, (x, idx))
 
     @register_conversion("torch.ops.dlinfer.rms_norm.default")
-    def npu_rms_norm(self, x, w, eps=1e-6):
+    def npu_rms_norm(self, x, w, eps=1e-6, quant_dtype=None):
         rms_norm = self.get_proxy(atb_op.RmsNorm, (x, w, eps))
         return rms_norm
 
@@ -347,7 +347,7 @@ class AtenToAtbTransformer(SingleOpTransformer):
         return mul
 
     @register_conversion("torch.ops.dlinfer.add_rms_norm.default")
-    def dlinfer_add_rms_norm(self, x1, x2, gamma, epsilon):
+    def dlinfer_add_rms_norm(self, x1, x2, gamma, epsilon, quant_dtype=None):
         add = self.get_proxy(atb_op.Add, (x1, x2))
         norm = self.get_proxy(atb_op.RmsNorm, (add, gamma, epsilon))
         # FIXME(tangzhiyi11): Temporarily disable graph op for MOE precision issues
