@@ -120,15 +120,32 @@ def prefill_attention(
         )[0]
     elif SocVersion.is_Ascend310P():
         assert num_q_heads == num_kv_heads, f"Ascend310P only support mha models."
-        attn_output = torch.ops.npu.npu_prompt_flash_attention(
-            query.unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            num_heads=num_q_heads,
-            scale_value=scale_value,
-            num_key_value_heads=num_kv_heads,
-            input_layout="BSND",
-        ).squeeze(0)
+        seq_qlen_list = q_seq_len.tolist()
+        batch = len(seq_qlen_list)
+        start = 0
+        for i in range(batch):
+            end = start + seq_qlen_list[i]
+            single_seqlen = int(seq_qlen_list[i])        
+        single_q = (
+                query[start:end].view(single_seqlen, num_q_heads, -1).transpose(0, 1)
+            )
+        single_k = (
+            key[start:end].view(single_seqlen, num_kv_heads, -1).transpose(0, 1)
+        )
+        single_v = (
+            value[start:end].view(single_seqlen, num_kv_heads, -1).transpose(0, 1)
+        )
+        single_out = attn_output[start:end, :].view(single_seqlen, num_q_heads, -1)
+        attn_weights = (
+                torch.matmul(single_q, single_k.transpose(-2, -1)) * scale_value
+            )
+        attn_weights += attn_mask[i].unsqueeze(0)
+        attn_probs = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            query.dtype
+        )
+        single_out[:] = (
+            torch.matmul(attn_probs, single_v).transpose(0, 1).contiguous()
+            )
     else:
         raise ValueError(
             f"dlinfer doesn't support {SocVersion.device_name()} device currently."
