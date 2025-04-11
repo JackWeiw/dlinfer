@@ -19,6 +19,7 @@ from dlinfer.graph.dicp.vendor.AtbGraph.codegen.utils import (
     get_reduce_dim,
 )
 
+from dlinfer.vendor.ascend.utils import SocVersion
 
 aten = torch.ops.aten
 conversions = {}
@@ -169,41 +170,53 @@ class AtenToAtbTransformer(SingleOpTransformer):
         v_scales_zeros,
         quant_bits,
     ):
-        key_cache_shape = key_cache.node.meta["val"].shape
-        key_shape = key.node.meta["val"].shape
-        key_cache = self.get_proxy(
-            atb_op.View,
-            (
-                key_cache,
-                (key_cache_shape[0], key_cache_shape[1], key_shape[-2], key_shape[-1]),
-            ),
-        )
-        value_cache_shape = value_cache.node.meta["val"].shape
-        value_shape = value.node.meta["val"].shape
-        is_mla = key_shape[-1] != value_shape[-1]
-        if not is_mla:
-            value_cache = self.get_proxy(
+        if SocVersion.is_Ascend910B():
+            key_cache_shape = key_cache.node.meta["val"].shape
+            key_shape = key.node.meta["val"].shape
+            key_cache = self.get_proxy(
                 atb_op.View,
                 (
-                    value_cache,
+                    key_cache,
                     (
-                        value_cache_shape[0],
-                        value_cache_shape[1],
-                        value_shape[-2],
-                        value_shape[-1],
+                        key_cache_shape[0],
+                        key_cache_shape[1],
+                        key_shape[-2],
+                        key_shape[-1],
                     ),
                 ),
             )
+            value_cache_shape = value_cache.node.meta["val"].shape
+            value_shape = value.node.meta["val"].shape
+            is_mla = key_shape[-1] != value_shape[-1]
+            if not is_mla:
+                value_cache = self.get_proxy(
+                    atb_op.View,
+                    (
+                        value_cache,
+                        (
+                            value_cache_shape[0],
+                            value_cache_shape[1],
+                            value_shape[-2],
+                            value_shape[-1],
+                        ),
+                    ),
+                )
+                out = self.get_proxy(
+                    atb_op.ReshapeAndCache,
+                    (key, value, key_cache, value_cache, kv_indices),
+                )
+            else:
+                out = self.get_proxy(
+                    atb_op.MlaReshapeAndCache,
+                    (key, key_cache, kv_indices),
+                )
+                out = self.get_proxy(atb_op.Tuple, (out, value_cache))
+        elif SocVersion.is_Ascend310P():
             out = self.get_proxy(
                 atb_op.ReshapeAndCache,
                 (key, value, key_cache, value_cache, kv_indices),
             )
-        else:
-            out = self.get_proxy(
-                atb_op.MlaReshapeAndCache,
-                (key, key_cache, kv_indices),
-            )
-            out = self.get_proxy(atb_op.Tuple, (out, value_cache))
+
         return out
 
     @register_conversion("torch.ops.dlinfer.paged_decode_attention.default")
@@ -245,7 +258,14 @@ class AtenToAtbTransformer(SingleOpTransformer):
                 (value_cache, (v_shape[0], v_shape[1], num_kv_heads, head_size_v)),
             )
         else:
-            head_size_v = v_shape[-1]
+            if SocVersion.is_Ascend910B():
+                head_size_v = v_shape[-1]
+            elif SocVersion.is_Ascend310P():
+                head_size_v = v_shape[1] * 16 // num_kv_heads
+            else:
+                raise ValueError(
+                    f"dlinfer doesn't support {SocVersion.device_name()} device currently."
+                )
         out = self.get_proxy(
             atb_op.PagedAttention,
             (
@@ -502,21 +522,43 @@ class AtenToAtbTransformer(SingleOpTransformer):
         scale = softmax_scale if softmax_scale else 1.0 / math.sqrt(head_size)
         if query.node.meta["val"].dtype != mask.node.meta["val"].dtype:
             mask = self.get_proxy(atb_op.Cast, (mask, query.node.meta["val"].dtype))
-        out = self.get_proxy(
-            atb_op.SelfAttentionPAEncoder,
-            (
-                query,
-                key,
-                value,
-                kv_seq_len,
-                mask,
-                num_q_heads,
-                num_kv_heads,
-                scale,
-                head_size,
-                head_size_v,
-            ),
-        )
+        if SocVersion.is_Ascend910B():
+            out = self.get_proxy(
+                atb_op.SelfAttentionPAEncoder,
+                (
+                    query,
+                    key,
+                    value,
+                    kv_seq_len,
+                    mask,
+                    num_q_heads,
+                    num_kv_heads,
+                    scale,
+                    head_size,
+                    head_size_v,
+                ),
+            )
+        elif SocVersion.is_Ascend310P():
+            # NOTE. SelfAttentionPAEncoder on 310P requires mask to be format of NZ.
+            out = self.get_proxy(
+                atb_op.SelfAttentionPAEncoder,
+                (
+                    query,
+                    key,
+                    value,
+                    kv_seq_len,
+                    self.get_proxy(atb_op.Transdata, (mask, 2)),
+                    num_q_heads,
+                    num_kv_heads,
+                    scale,
+                    head_size,
+                    head_size_v,
+                ),
+            )
+        else:
+            raise ValueError(
+                f"dlinfer doesn't support {SocVersion.device_name()} device currently."
+            )
         return out
 
     @register_conversion("torch.ops.dlinfer.paged_prefill_attention.default")
@@ -553,7 +595,7 @@ class AtenToAtbTransformer(SingleOpTransformer):
         head_size_v = (
             key_cache_shape[-1] // num_kv_heads
             if is_kv_require_reshape
-            else key_cache_shape[-1]
+            else (key_cache_shape[-1] if SocVersion.is_Ascend910B() else key_cache_shape[1] * 16 // num_kv_heads)
         )
         scale = softmax_scale if softmax_scale else 1.0 / math.sqrt(head_size)
         if query.node.meta["val"].dtype != mask.node.meta["val"].dtype:
@@ -578,7 +620,7 @@ class AtenToAtbTransformer(SingleOpTransformer):
                 value_cache,
                 block_table,
                 kv_seq_len,
-                mask,
+                mask if SocVersion.is_Ascend910B() else self.get_proxy(atb_op.Transdata, (mask, 2)),
                 num_q_heads,
                 num_kv_heads,
                 scale,

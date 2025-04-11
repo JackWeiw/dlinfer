@@ -60,6 +60,7 @@ def apply_rotary_pos_emb(
     cos: Optional[Tensor],
     sin: Optional[Tensor],
 ) -> Tuple[Tensor, Tensor]:
+    import pdb; pdb.set_trace()
     """
     Apply rotary position embeddings to the query and key tensors.
 
@@ -222,7 +223,7 @@ def paged_decode_attention_impl_abstract_func(
         head_size_v = value_cache.shape[-1] // num_kv_heads
     else:
         head_size_v = value_cache.shape[-1]
-    return query.new_empty(query.shape[0], num_q_heads, head_size_v)
+    return query.new_empty(*query.shape)
 
 
 @register_custom_op(

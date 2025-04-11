@@ -279,6 +279,8 @@ atb::Status Model::Execute(atb::Context* context, std::vector<atb::Tensor>& inTe
 
 atb::Status Model::ExecuteNode(int nodeId) {
     auto& node = graph_.nodes.at(nodeId);
+    auto opname = node.operation->GetName();
+    DICP_LOG(INFO) << "op name in model.cpp:" << opname;
     atb::Status st = node.operation->Setup(node.variantPack, node.workspaceSize, context_);
     if (st != 0) {
         DICP_LOG(ERROR) << modelId_ << " setup node[" << nodeId << "] fail, not call execute";

@@ -21,6 +21,7 @@ from dlinfer.graph.dicp.vendor.AtbGraph.codegen.utils import (
     get_ascend_dtype,
 )
 
+from dlinfer.vendor.ascend.utils import SocVersion
 
 class AtbOverrides:
     def gen_args(op_var, args_dict, args):
@@ -66,7 +67,14 @@ class AtbOverrides:
             if group and group != "":
                 param.commDomain = group
         else:
-            param.backend = "lccl"
+            if SocVersion.is_Ascend910B():
+                param.backend = "hccl"
+            elif SocVersion.is_Ascend310P():
+                param.backend = "hccl"
+            else:
+                raise RuntimeError(
+                    f"Unsupported device name: {SocVersion.device_name()}"
+                )
 
         if bias:
             op.set_input([x, weight, bias])
@@ -92,7 +100,14 @@ class AtbOverrides:
             if group and group != "":
                 param.commDomain = group
         else:
-            param.backend = "lccl"
+            if SocVersion.is_Ascend910B():
+                param.backend = "hccl"
+            elif SocVersion.is_Ascend310P():
+                param.backend = "hccl"
+            else:
+                raise RuntimeError(
+                    f"Unsupported device name: {SocVersion.device_name()}"
+                )
 
         op.set_input([x])
         op.set_param(param)
@@ -469,6 +484,8 @@ class AtbOverrides:
         head_size_v,
     ):
         is_mla = head_size != head_size_v
+        if is_mla:
+            import pdb; pdb.set_trace()
         op = Operation(name, "PagedAttentionOperation")
         param = infer_param.PagedAttentionParam()
         param.headNum = q_head_num
@@ -516,6 +533,14 @@ class AtbOverrides:
         op.set_output([name])
         return op
 
+    def Transdata(name, x, transdataType):
+         op = Operation(name, "TransdataOperation")
+         param = infer_param.TransdataParam(transdataType)
+         op.set_param(param)
+         op.set_input([x])
+         op.set_output([name])
+         return op
+     
     def Tuple(name, *args, **kwargs):
         op = TupleOperation(name)
         op.set_input(list(args))
