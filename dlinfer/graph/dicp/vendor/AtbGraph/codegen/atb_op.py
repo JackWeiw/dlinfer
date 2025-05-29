@@ -69,16 +69,17 @@ class AtbOverrides:
         rank_table_file = os.environ.get("ASCEND_RANK_TABLE_FILE_PATH", None)
         if (
             use_lccl == "1"
-            and rank_table_file is None
+            and rank_table_file is not None
             and not SocVersion.is_Ascend310P()
         ):
             param.backend = "lccl"
         else:
             param.backend = "hccl"
-            param.commDomain = group if group is not None else ""
             if rank_table_file is not None:
                 param.rankTableFile = rank_table_file
-
+        
+        param.commDomain = group if group is not None else ""
+        
         if bias:
             op.set_input([x, weight, bias])
         else:
